@@ -1,0 +1,984 @@
+AWSTemplateFormatVersion: "2010-09-09"
+Description: An example Drupal 8 CloudFormation stack.
+
+Mappings:
+  RegionMap:
+    ap-southeast-2:
+      "AmazonLinux2HVM64": "ami-08a74056dfd30c986"
+      "AmazonLinuxNATHVM64": "ami-01866304647fb36d8"
+
+Parameters:
+  MyHomeCIDR:
+    Type: String
+    ConstraintDescription: My home CIDR range.
+
+  MyMobilePhoneNumber:
+    Type: String
+    ConstraintDescription: My mobile phone number.
+    AllowedPattern: "\\+614\\d{8}"
+
+  KeyName:
+    Description: KeyPair
+    Type: AWS::EC2::KeyPair::KeyName
+    ConstraintDescription: Must be the name of an existing EC2 KeyPair.
+
+  LogsBucketName:
+    Description: Name for the S3 bucket in which to store log files.
+    Type: String
+    AllowedPattern: "[a-z0-9\\-\\.]{3,63}"
+
+  DatabaseMasterUsername:
+    Description: DatabaseMasterUsername
+    Type: String
+    ConstraintDescription: Master username for the database.
+    Default: "drupal"
+
+  DatabaseMasterPassword:
+    Description: DatabaseMasterPassword
+    Type: String
+    ConstraintDescription: Master password for the database.
+    NoEcho: true
+
+  EC2InstanceType:
+    Description: EC2 instance type
+    Type: String
+    AllowedValues:
+      - t2.micro
+      - t2.small
+      - t2.medium
+    ConstraintDescription: Must be a valid EC2 instance type.
+    Default: t2.micro
+
+  RDSInstanceType:
+    Description: RDS instance type
+    Type: String
+    AllowedValues:
+      # must be at least t2.small to support encryption at rest
+      # https://docs.aws.amazon.com/AmazonRDS/latest/UserGuide/Overview.Encryption.html#Overview.Encryption.Availability
+      - db.t2.small
+      - db.t2.medium
+    ConstraintDescription: Must be a valid RDS instance type.
+    Default: db.t2.small
+
+  VpcCIDR:
+    Description: VPC CIDR
+    Type: String
+    Default: 10.123.0.0/16
+
+  PublicSubnet1CIDR:
+    Description: CIDR for public subnet 1
+    Type: String
+    Default: 10.123.1.0/24
+
+  PublicSubnet2CIDR:
+    Description: CIDR for public subnet 2
+    Type: String
+    Default: 10.123.2.0/24
+
+  PublicSubnet3CIDR:
+    Description: CIDR for public subnet 3
+    Type: String
+    Default: 10.123.3.0/24
+
+  PrivateSubnet1CIDR:
+    Description: CIDR for private subnet 1
+    Type: String
+    Default: 10.123.11.0/24
+
+  PrivateSubnet2CIDR:
+    Description: CIDR for private subnet 2
+    Type: String
+    Default: 10.123.12.0/24
+
+  PrivateSubnet3CIDR:
+    Description: CIDR for private subnet 3
+    Type: String
+    Default: 10.123.13.0/24
+
+Resources:
+  # NETWORKING
+
+  VPC:
+    Type: AWS::EC2::VPC
+    Properties:
+      CidrBlock: !Ref VpcCIDR
+      EnableDnsSupport: true
+      EnableDnsHostnames: true
+
+  PublicSubnet1:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId: !Ref VPC
+      AvailabilityZone: !Select [0, !GetAZs ""]
+      CidrBlock: !Ref PublicSubnet1CIDR
+      MapPublicIpOnLaunch: true
+
+  PublicSubnet2:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId: !Ref VPC
+      AvailabilityZone: !Select [1, !GetAZs ""]
+      CidrBlock: !Ref PublicSubnet2CIDR
+      MapPublicIpOnLaunch: true
+
+  PublicSubnet3:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId: !Ref VPC
+      AvailabilityZone: !Select [2, !GetAZs ""]
+      CidrBlock: !Ref PublicSubnet3CIDR
+      MapPublicIpOnLaunch: true
+
+  PrivateSubnet1:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId: !Ref VPC
+      AvailabilityZone: !Select [0, !GetAZs ""]
+      CidrBlock: !Ref PrivateSubnet1CIDR
+      MapPublicIpOnLaunch: false
+
+  PrivateSubnet2:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId: !Ref VPC
+      AvailabilityZone: !Select [1, !GetAZs ""]
+      CidrBlock: !Ref PrivateSubnet2CIDR
+      MapPublicIpOnLaunch: false
+
+  PrivateSubnet3:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId: !Ref VPC
+      AvailabilityZone: !Select [2, !GetAZs ""]
+      CidrBlock: !Ref PrivateSubnet3CIDR
+      MapPublicIpOnLaunch: false
+
+  InternetGateway:
+    Type: AWS::EC2::InternetGateway
+
+  InternetGatewayAttachment:
+    Type: AWS::EC2::VPCGatewayAttachment
+    Properties:
+      InternetGatewayId: !Ref InternetGateway
+      VpcId: !Ref VPC
+
+  # NETWORKING: ROUTING
+
+  PublicRouteTable:
+    Type: AWS::EC2::RouteTable
+    Properties:
+      VpcId: !Ref VPC
+
+  PrivateRouteTable:
+    Type: AWS::EC2::RouteTable
+    Properties:
+      VpcId: !Ref VPC
+
+  PrivateToInternetRoute:
+    Type: AWS::EC2::Route
+    Properties:
+      RouteTableId:
+        Ref: PrivateRouteTable
+      DestinationCidrBlock: 0.0.0.0/0
+      InstanceId:
+        Ref: NAT
+
+  PublicToInternetRoute:
+    Type: AWS::EC2::Route
+    DependsOn: InternetGateway
+    Properties:
+      RouteTableId:
+        Ref: PublicRouteTable
+      DestinationCidrBlock: 0.0.0.0/0
+      GatewayId:
+        Ref: InternetGateway
+
+  PrivateSubnet1PrivateRouteTableAssociation:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties:
+      RouteTableId: !Ref PrivateRouteTable
+      SubnetId: !Ref PrivateSubnet1
+
+  PrivateSubnet2PrivateRouteTableAssociation:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties:
+      RouteTableId: !Ref PrivateRouteTable
+      SubnetId: !Ref PrivateSubnet2
+
+  PrivateSubnet3PrivateRouteTableAssociation:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties:
+      RouteTableId: !Ref PrivateRouteTable
+      SubnetId: !Ref PrivateSubnet3
+
+  PublicSubnet1PublicRouteTableAssociation:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties:
+      RouteTableId: !Ref PublicRouteTable
+      SubnetId: !Ref PublicSubnet1
+
+  PublicSubnet2PublicRouteTableAssociation:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties:
+      RouteTableId: !Ref PublicRouteTable
+      SubnetId: !Ref PublicSubnet2
+
+  PublicSubnet3PublicRouteTableAssociation:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties:
+      RouteTableId: !Ref PublicRouteTable
+      SubnetId: !Ref PublicSubnet3
+
+  # NETWORKING: NACL
+  # https://docs.aws.amazon.com/vpc/latest/userguide/vpc-recommended-nacl-rules.html#nacl-rules-scenario-2
+
+  PublicNACL:
+    Type: AWS::EC2::NetworkAcl
+    Properties:
+      VpcId: !Ref VPC
+
+  PublicSubnet1NACL:
+    Type: AWS::EC2::SubnetNetworkAclAssociation
+    Properties:
+      NetworkAclId: !Ref PublicNACL
+      SubnetId: !Ref PublicSubnet1
+
+  PublicSubnet2NACL:
+    Type: AWS::EC2::SubnetNetworkAclAssociation
+    Properties:
+      NetworkAclId: !Ref PublicNACL
+      SubnetId: !Ref PublicSubnet2
+
+  PublicSubnet3NACL:
+    Type: AWS::EC2::SubnetNetworkAclAssociation
+    Properties:
+      NetworkAclId: !Ref PublicNACL
+      SubnetId: !Ref PublicSubnet3
+
+  PublicNACLSSHIn:
+    Type: AWS::EC2::NetworkAclEntry
+    Properties:
+      RuleNumber: 100
+      CidrBlock: !Ref MyHomeCIDR
+      NetworkAclId: !Ref PublicNACL
+      Protocol: 6 # tcp
+      PortRange:
+        From: 22
+        To: 22
+      RuleAction: allow
+
+  PublicNACLHTTPIn:
+    Type: AWS::EC2::NetworkAclEntry
+    Properties:
+      RuleNumber: 200
+      CidrBlock: 0.0.0.0/0
+      NetworkAclId: !Ref PublicNACL
+      Protocol: 6 # tcp
+      PortRange:
+        From: 80
+        To: 80
+      RuleAction: allow
+
+  PublicNACLHTTPSIn:
+    Type: AWS::EC2::NetworkAclEntry
+    Properties:
+      RuleNumber: 300
+      CidrBlock: 0.0.0.0/0
+      NetworkAclId: !Ref PublicNACL
+      Protocol: 6 # tcp
+      PortRange:
+        From: 443
+        To: 443
+      RuleAction: allow
+
+  PublicNACLEphemerealIn: # incoming in response to outgoing
+    Type: AWS::EC2::NetworkAclEntry
+    Properties:
+      RuleNumber: 400
+      CidrBlock: 0.0.0.0/0 # both from HTTP/S out and SSH, HTTP to the private
+      NetworkAclId: !Ref PublicNACL
+      Protocol: 6 # tcp
+      PortRange:
+        From: 1024
+        To: 65535
+      RuleAction: allow
+
+  PublicNACLEphemerealOut: # outgoing in response to incoming
+    Type: AWS::EC2::NetworkAclEntry
+    Properties:
+      RuleNumber: 2000
+      CidrBlock: 0.0.0.0/0
+      NetworkAclId: !Ref PublicNACL
+      Protocol: 6 # tcp
+      Egress: true
+      PortRange:
+        From: 1024
+        To: 65535
+      RuleAction: allow
+
+  PublicNACLHTTPOut: # yum updates, etc
+    Type: AWS::EC2::NetworkAclEntry
+    Properties:
+      RuleNumber: 2100
+      CidrBlock: 0.0.0.0/0
+      NetworkAclId: !Ref PublicNACL
+      Protocol: 6 # tcp
+      Egress: true
+      PortRange:
+        From: 80
+        To: 80
+      RuleAction: allow
+
+  PublicNACLHTTPSOut: # yum updates, etc
+    Type: AWS::EC2::NetworkAclEntry
+    Properties:
+      RuleNumber: 2200
+      CidrBlock: 0.0.0.0/0
+      NetworkAclId: !Ref PublicNACL
+      Protocol: 6 # tcp
+      Egress: true
+      PortRange:
+        From: 443
+        To: 443
+      RuleAction: allow
+
+  PublicNACLSSHToPrivate:
+    Type: AWS::EC2::NetworkAclEntry
+    Properties:
+      RuleNumber: 2300
+      CidrBlock: !Ref VpcCIDR
+      NetworkAclId: !Ref PublicNACL
+      Protocol: 6 # tcp
+      Egress: true
+      PortRange:
+        From: 22
+        To: 22
+      RuleAction: allow
+
+  PrivateNACL:
+    Type: AWS::EC2::NetworkAcl
+    Properties:
+      VpcId: !Ref VPC
+
+  PrivateSubnet1NACL:
+    Type: AWS::EC2::SubnetNetworkAclAssociation
+    Properties:
+      NetworkAclId: !Ref PrivateNACL
+      SubnetId: !Ref PrivateSubnet1
+
+  PrivateSubnet2NACL:
+    Type: AWS::EC2::SubnetNetworkAclAssociation
+    Properties:
+      NetworkAclId: !Ref PrivateNACL
+      SubnetId: !Ref PrivateSubnet2
+
+  PrivateSubnet3NACL:
+    Type: AWS::EC2::SubnetNetworkAclAssociation
+    Properties:
+      NetworkAclId: !Ref PrivateNACL
+      SubnetId: !Ref PrivateSubnet3
+
+  PrivateNACLSSHIn:
+    Type: AWS::EC2::NetworkAclEntry
+    Properties:
+      RuleNumber: 100
+      CidrBlock: !Ref VpcCIDR
+      NetworkAclId: !Ref PrivateNACL
+      Protocol: 6 # tcp
+      PortRange:
+        From: 22
+        To: 22
+      RuleAction: allow
+
+  PrivateNACLHTTPIn:
+    Type: AWS::EC2::NetworkAclEntry
+    Properties:
+      RuleNumber: 200
+      CidrBlock: !Ref VpcCIDR
+      NetworkAclId: !Ref PrivateNACL
+      Protocol: 6 # tcp
+      PortRange:
+        From: 80
+        To: 80
+      RuleAction: allow
+
+  PrivateNACLDatabaseIn:
+    Type: AWS::EC2::NetworkAclEntry
+    Properties:
+      RuleNumber: 300
+      CidrBlock: !Ref VpcCIDR
+      NetworkAclId: !Ref PrivateNACL
+      Protocol: 6 # tcp
+      PortRange:
+        From: 3306 # MySQL
+        To: 3306
+      RuleAction: allow
+
+  PrivateNACLEphemerealIn:
+    Type: AWS::EC2::NetworkAclEntry
+    Properties:
+      RuleNumber: 400
+      CidrBlock: 0.0.0.0/0 # packets from nat will have source ip from worldwide
+      NetworkAclId: !Ref PrivateNACL
+      Protocol: 6 # tcp
+      PortRange:
+        From: 1024
+        To: 65535
+      RuleAction: allow
+
+  PrivateNACLEphemerealOut: # outgoing in response to incoming
+    Type: AWS::EC2::NetworkAclEntry
+    Properties:
+      RuleNumber: 2000
+      CidrBlock: !Ref VpcCIDR
+      NetworkAclId: !Ref PrivateNACL
+      Protocol: 6 # tcp
+      Egress: true
+      PortRange:
+        From: 1024
+        To: 65535
+      RuleAction: allow
+
+  PrivateNACLHTTPOut: # yum updates, etc
+    Type: AWS::EC2::NetworkAclEntry
+    Properties:
+      RuleNumber: 2100
+      CidrBlock: 0.0.0.0/0 # will route to nat, but dest ip will be worldwide
+      NetworkAclId: !Ref PrivateNACL
+      Protocol: 6 # tcp
+      Egress: true
+      PortRange:
+        From: 80
+        To: 80
+      RuleAction: allow
+
+  PrivateNACLHTTPSOut: # yum updates, etc
+    Type: AWS::EC2::NetworkAclEntry
+    Properties:
+      RuleNumber: 2200
+      CidrBlock: 0.0.0.0/0 # will route to nat, but dest ip will be worldwide
+      NetworkAclId: !Ref PrivateNACL
+      Protocol: 6 # tcp
+      Egress: true
+      PortRange:
+        From: 443
+        To: 443
+      RuleAction: allow
+
+  # NETWORKING: WAF
+
+  XssMatchSet:
+    Type: AWS::WAF::XssMatchSet
+    Properties:
+      Name: "XSS matcher"
+      XssMatchTuples:
+        - FieldToMatch:
+            Type: QUERY_STRING
+          TextTransformation: URL_DECODE
+
+  XssRule:
+    Type: AWS::WAF::Rule
+    Properties:
+      Name: XSSRule
+      MetricName: XSSRule
+      Predicates:
+        - DataId: !Ref XssMatchSet
+          Negated: false
+          Type: XssMatch
+
+  SqlInjectionMatchSet:
+    Type: AWS::WAF::SqlInjectionMatchSet
+    Properties:
+      Name: "SQLi matcher"
+      SqlInjectionMatchTuples:
+        - FieldToMatch:
+            Type: QUERY_STRING
+          TextTransformation: URL_DECODE
+
+  SqlInjectionRule:
+    Type: AWS::WAF::Rule
+    Properties:
+      Name: SQLiRule
+      MetricName: SQLiRule
+      Predicates:
+        - DataId: !Ref SqlInjectionMatchSet
+          Negated: false
+          Type: SqlInjectionMatch
+
+  WebACL:
+    Type: AWS::WAF::WebACL
+    Properties:
+      DefaultAction:
+        Type: ALLOW
+      Name: !Sub ${AWS::StackName}WebACL
+      MetricName: !Sub ${AWS::StackName}WebACL
+      Rules:
+        - Action:
+            Type: BLOCK
+          Priority: 1
+          RuleId: !Ref XssRule
+        - Action:
+            Type: BLOCK
+          Priority: 2
+          RuleId: !Ref SqlInjectionRule
+
+  # SECURITY GROUPS
+
+  ApplicationLoadBalancerSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupName: "alb-sg"
+      GroupDescription: "Allows HTTP and HTTPS from the world."
+      VpcId: !Ref VPC
+      SecurityGroupIngress:
+        - IpProtocol: tcp
+          FromPort: 80
+          ToPort: 80
+          CidrIp: 0.0.0.0/0
+        - IpProtocol: tcp
+          FromPort: 443
+          ToPort: 443
+          CidrIp: 0.0.0.0/0
+
+  BastionSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupName: "bastion-sg"
+      GroupDescription: "Allows SSH from home."
+      VpcId: !Ref VPC
+      SecurityGroupIngress:
+        - IpProtocol: tcp
+          FromPort: 22
+          ToPort: 22
+          CidrIp: !Ref MyHomeCIDR
+
+  WebServerSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupName: "web-server-sg"
+      GroupDescription: "Allows HTTP and SSH from internal."
+      VpcId: !Ref VPC
+      SecurityGroupIngress:
+        - IpProtocol: tcp
+          FromPort: 22
+          ToPort: 22
+          CidrIp: !Ref VpcCIDR
+        - IpProtocol: tcp
+          FromPort: 80
+          ToPort: 80
+          CidrIp: !Ref VpcCIDR
+
+  RDSSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupName: "rds-sg"
+      GroupDescription: "Allows MySQL from internal."
+      VpcId: !Ref VPC
+      SecurityGroupIngress:
+        - IpProtocol: tcp
+          FromPort: 3306
+          ToPort: 3306
+          CidrIp: !Ref VpcCIDR
+
+  NATSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupName: "nat-sg"
+      GroupDescription: "Allows any traffic from internal."
+      VpcId: !Ref VPC
+      SecurityGroupIngress:
+        - IpProtocol: tcp
+          FromPort: 0
+          ToPort: 65535
+          CidrIp: !Ref VpcCIDR
+
+  EFSSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupName: "efs-sg"
+      GroupDescription: "Allows NFS traffic from internal."
+      VpcId: !Ref VPC
+      SecurityGroupIngress:
+        - IpProtocol: tcp
+          FromPort: 2049
+          ToPort: 2049
+          CidrIp: !Ref VpcCIDR
+
+  # IAM
+
+  DrupalInstanceRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: DrupalInstanceRole
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service:
+                - ec2.amazonaws.com
+            Action:
+              - sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/CloudWatchAgentServerPolicy
+      Policies:
+        - PolicyName: GetDrupalHashSalt
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: Allow
+                Action: ssm:GetParameter
+                Resource: !Sub "arn:aws:ssm:${AWS::Region}:${AWS::AccountId}:parameter/drupal_hash_salt"
+
+  DrupalInstanceProfile:
+    Type: AWS::IAM::InstanceProfile
+    Properties:
+      InstanceProfileName: DrupalInstanceProfile
+      Roles:
+        - !Ref DrupalInstanceRole
+
+  # HOSTS
+
+  NAT:
+    Type: "AWS::EC2::Instance" # using an instance just because gateways are expensive
+    Properties:
+      SubnetId: !Ref PublicSubnet1
+      ImageId: !FindInMap [RegionMap, !Ref "AWS::Region", "AmazonLinuxNATHVM64"]
+      InstanceType:
+        Ref: EC2InstanceType
+      KeyName:
+        Ref: KeyName
+      SourceDestCheck: false
+      SecurityGroupIds: [!Ref NATSecurityGroup]
+
+  Bastion:
+    Type: "AWS::EC2::Instance"
+    Properties:
+      SubnetId: !Ref PublicSubnet2
+      ImageId: !FindInMap [RegionMap, !Ref "AWS::Region", "AmazonLinux2HVM64"]
+      InstanceType:
+        Ref: EC2InstanceType
+      KeyName:
+        Ref: KeyName
+      SecurityGroupIds: [!Ref BastionSecurityGroup]
+
+  BastionEIP:
+    Type: AWS::EC2::EIP
+    Properties:
+      InstanceId: !Ref Bastion
+
+  DatabaseSubnetGroup:
+    Type: AWS::RDS::DBSubnetGroup
+    Properties:
+      DBSubnetGroupDescription: "Database subnet group for the Drupal content database."
+      DBSubnetGroupName: drupal-database-sngrp
+      SubnetIds:
+        - !Ref PrivateSubnet1
+        - !Ref PrivateSubnet2
+        - !Ref PrivateSubnet3
+
+  Database:
+    Type: AWS::RDS::DBInstance
+    DeletionPolicy: Snapshot
+    Properties:
+      AllocatedStorage: 20
+      DBInstanceClass: !Ref RDSInstanceType
+      DBInstanceIdentifier: drupal
+      Engine: MySQL
+      DBName: drupal
+      DBSubnetGroupName: !Ref DatabaseSubnetGroup
+      MasterUsername: !Ref DatabaseMasterUsername
+      MasterUserPassword: !Ref DatabaseMasterPassword
+      StorageEncrypted: true
+      VPCSecurityGroups:
+        - !Ref RDSSecurityGroup
+
+  DrupalLaunchTemplate:
+    Type: AWS::EC2::LaunchTemplate
+    Metadata:
+      AWS::CloudFormation::Init:
+        configSets:
+          default: [preinstall, install, configure, postconfigure, start]
+        preinstall:
+          commands:
+            php_7:
+              command: "amazon-linux-extras enable php7.2"
+            yum_update:
+              command: "yum update -y"
+        install:
+          packages:
+            yum:
+              httpd: []
+              mariadb: [] # client
+              php: [7.2.24]
+              php-gd: []
+              php-mbstring: []
+              php-mysqlnd: []
+              php-opcache: []
+              php-xml: []
+              amazon-efs-utils: []
+            rpm:
+              amazon-cloudwatch-agent: "https://s3.amazonaws.com/amazoncloudwatch-agent/amazon_linux/amd64/latest/amazon-cloudwatch-agent.rpm"
+          sources:
+            /var/www: "https://ftp.drupal.org/files/projects/drupal-8.7.10.tar.gz"
+          files:
+            /usr/local/bin/drush:
+              source: https://github.com/drush-ops/drush/releases/download/8.3.2/drush.phar
+              mode: "000755" # executable
+        configure:
+          sources:
+            /etc/ssl/certs/rds-combined-ca-bundle.pem: "https://s3.amazonaws.com/rds-downloads/rds-combined-ca-bundle.pem"
+          commands:
+            update_document_root:
+              command:
+                - sed
+                - -si
+                - s|DocumentRoot "/var/www/html"|DocumentRoot "/var/www/drupal-8.7.10"|g
+                - /etc/httpd/conf/httpd.conf
+            files_dir_1_create:
+              command: mkdir /var/www/drupal-8.7.10/sites/default/files
+            files_dir_2_mount:
+              command: !Sub mount -t efs ${DrupalSharedFiles}:/ /var/www/drupal-8.7.10/sites/default/files
+            files_dir_3_chgrp:
+              command: chgrp -R apache /var/www/drupal-8.7.10/sites/default/files
+            files_dir_4_chmod:
+              command: chmod -R g+w /var/www/drupal-8.7.10/sites/default/files
+          files:
+            /tmp/install.cmd:
+              content: |
+                sudo /usr/local/bin/drush -r /var/www/drupal-8.7.10/ site-install --yes
+                sudo /usr/local/bin/drush -r /var/www/drupal-8.7.10/ cache-rebuild
+            /opt/aws/amazon-cloudwatch-agent/etc/amazon-cloudwatch-agent.json:
+              content: !Sub |
+                {
+                    "metrics": {
+                        "append_dimensions": {
+                            "AutoScalingGroupName": "${!aws:AutoScalingGroupName}",
+                            "ImageId": "${!aws:ImageId}",
+                            "InstanceId": "${!aws:InstanceId}",
+                            "InstanceType": "${!aws:InstanceType}"
+                        },
+                        "metrics_collected": {
+                            "disk": {
+                              "resources": [ "/" ],
+                              "measurement": [ "used_percent" ] 
+                            },
+                            "swap": { "measurement": [ "used_percent" ] },
+                            "mem": { "measurement": [ "used_percent" ] }
+                        }
+                    },
+                    "logs": {
+                        "logs_collected": {
+                            "files": {
+                                "collect_list": [
+                                    {
+                                        "log_group_name": "apache/access",
+                                        "file_path": "/var/log/httpd/access_log*"
+                                    },
+                                    {
+                                        "log_group_name": "apache/error",
+                                        "file_path": "/var/log/httpd/error_log*"
+                                    }
+                                ]
+                            }
+                        },
+                        "log_stream_name": "{instance_id}"
+                    }
+                }
+            /etc/httpd/conf.d/drupal.conf:
+              content: |
+                <Directory "/var/www/drupal-8.7.10">
+                  Options Indexes FollowSymLinks
+                  AllowOverride All
+                  Require all granted
+                </Directory>
+            /var/www/drupal-8.7.10/sites/default/settings.php:
+              content: !Sub |
+                <?php
+                $databases['default']['default'] = array(
+                  'database' => 'drupal',
+                  'username' => '${DatabaseMasterUsername}',
+                  'password' => '${DatabaseMasterPassword}',
+                  'host' => '${Database.Endpoint.Address}',
+                  'port' => '3306',
+                  'driver' => 'mysql',
+                  'prefix' => '',
+                  'collation' => 'utf8mb4_general_ci',
+                  'pdo' => array(
+                    PDO::MYSQL_ATTR_SSL_CA => '/etc/ssl/certs/rds-combined-ca-bundle.pem',
+                  ),
+                );
+                $config_directories = array(); // TODO
+                $settings['hash_salt'] = file_get_contents('/var/www/drupal-8.7.10/sites/default/hash_salt');
+                $settings['container_yamls'][] = $app_root . '/' . $site_path . '/services.yml';
+                $settings['file_scan_ignore_directories'] = array(
+                  'node_modules',
+                  'bower_components',
+                );
+              mode: "000644"
+              owner: "root"
+              group: "root"
+        postconfigure:
+          commands:
+            set_hash_salt:
+              # it would be nicer to get this dynamically instead of hardcoding it at instance creation
+              command: aws ssm get-parameter --name drupal_hash_salt --region ap-southeast-2 --with-decryption --query Parameter.Value --output text > /var/www/drupal-8.7.10/sites/default/hash_salt
+        start:
+          services:
+            sysvinit:
+              httpd:
+                enabled: "true"
+                ensureRunning: "true"
+                files:
+                  - "/etc/httpd/httpd.conf" # restart if we reconfigure
+                packages:
+                  yum: # restart if we re/install any dependencies
+                    - php
+                    - php-gd
+                    - php-mbstring
+                    - php-mysqlnd
+                    - php-opcache
+                    - php-xml
+          commands:
+            start_cloudwatch_agent:
+              command: /opt/aws/amazon-cloudwatch-agent/bin/amazon-cloudwatch-agent-ctl -a fetch-config -m ec2 -c file:/opt/aws/amazon-cloudwatch-agent/etc/amazon-cloudwatch-agent.json -s
+    Properties:
+      LaunchTemplateName: "drupal-lt"
+      LaunchTemplateData:
+        ImageId: !FindInMap [RegionMap, !Ref "AWS::Region", "AmazonLinux2HVM64"]
+        InstanceType:
+          Ref: EC2InstanceType
+        IamInstanceProfile:
+          Name: !Ref DrupalInstanceProfile
+        KeyName:
+          Ref: KeyName
+        SecurityGroupIds: [!Ref WebServerSecurityGroup]
+        UserData:
+          Fn::Base64: !Sub |
+            #!/bin/bash -ex
+            /opt/aws/bin/cfn-init -v --stack ${AWS::StackName} --resource DrupalLaunchTemplate --region ${AWS::Region}
+
+  DrupalSharedFiles:
+    Type: AWS::EFS::FileSystem
+
+  DrupalSharedFilesMount1:
+    Type: AWS::EFS::MountTarget
+    Properties:
+      FileSystemId: !Ref DrupalSharedFiles
+      SubnetId: !Ref PrivateSubnet1
+      SecurityGroups:
+        - !Ref EFSSecurityGroup
+
+  DrupalSharedFilesMount2:
+    Type: AWS::EFS::MountTarget
+    Properties:
+      FileSystemId: !Ref DrupalSharedFiles
+      SubnetId: !Ref PrivateSubnet2
+      SecurityGroups:
+        - !Ref EFSSecurityGroup
+
+  DrupalSharedFilesMount3:
+    Type: AWS::EFS::MountTarget
+    Properties:
+      FileSystemId: !Ref DrupalSharedFiles
+      SubnetId: !Ref PrivateSubnet3
+      SecurityGroups:
+        - !Ref EFSSecurityGroup
+
+  DrupalAutoscalingGroup:
+    Type: AWS::AutoScaling::AutoScalingGroup
+    Properties:
+      AutoScalingGroupName: drupal-asg
+      LaunchTemplate:
+        LaunchTemplateId: !Ref DrupalLaunchTemplate
+        Version: !GetAtt DrupalLaunchTemplate.LatestVersionNumber
+      MinSize: 3
+      MaxSize: 7
+      TargetGroupARNs:
+        - !Ref ApplicationLoadBalancerTargetGroup
+      VPCZoneIdentifier:
+        - !Ref PrivateSubnet1
+        - !Ref PrivateSubnet2
+        - !Ref PrivateSubnet3
+    UpdatePolicy:
+      AutoScalingRollingUpdate:
+        MinInstancesInService: 1
+        MaxBatchSize: 1
+        PauseTime: "PT3M"
+        SuspendProcesses:
+          - AlarmNotification
+          - AZRebalance
+          - HealthCheck
+          - ReplaceUnhealthy
+          - ScheduledActions
+
+  ApplicationLoadBalancer:
+    Type: AWS::ElasticLoadBalancingV2::LoadBalancer
+    Properties:
+      Name: drupal-alb
+      LoadBalancerAttributes:
+        - Key: access_logs.s3.enabled
+          Value: true
+        - Key: access_logs.s3.bucket
+          Value: !Ref LogsBucketName
+      SecurityGroups: [!Ref ApplicationLoadBalancerSecurityGroup]
+      Subnets:
+        - !Ref PublicSubnet1
+        - !Ref PublicSubnet2
+        - !Ref PublicSubnet3
+      Type: application
+
+  ApplicationLoadBalancerListener:
+    Type: AWS::ElasticLoadBalancingV2::Listener
+    Properties:
+      DefaultActions:
+        - Type: "forward"
+          TargetGroupArn: !Ref ApplicationLoadBalancerTargetGroup
+      LoadBalancerArn: !Ref ApplicationLoadBalancer
+      Port: 80
+      Protocol: HTTP
+
+  ApplicationLoadBalancerTargetGroup:
+    Type: AWS::ElasticLoadBalancingV2::TargetGroup
+    Properties:
+      Name: drupal-tg
+      Port: 80
+      Protocol: HTTP
+      VpcId: !Ref VPC
+
+  ZeroHealthyHostsAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: !Sub ${AWS::StackName}-ZeroHealthyHosts
+      AlarmActions:
+        - !Ref ZeroHealthyHostsAlarmTopic
+      Dimensions:
+        - Name: TargetGroup
+          Value: targetgroup/drupal-tg/df7202616d0bed71 # FIXME: should be a ref
+        - Name: LoadBalancer
+          Value: app/drupal-alb/ee7e1d3d3c281893 # FIXME: should be a ref
+      MetricName: HealthyHostCount
+      EvaluationPeriods: 1
+      ComparisonOperator: LessThanOrEqualToThreshold
+      Namespace: AWS/ApplicationELB
+      Period: 120
+      Statistic: Average
+      Threshold: 0
+
+  ZeroHealthyHostsAlarmTopic:
+    Type: AWS::SNS::Topic
+    Properties:
+      TopicName: !Sub ${AWS::StackName}-ZeroHealthyHostsAlarm
+      Subscription:
+        - Protocol: sms
+          Endpoint: !Ref MyMobilePhoneNumber
+
+Outputs:
+  BastionIP:
+    Value: !GetAtt Bastion.PublicIp
+
+  ApplicationLoadBalancerURL:
+    Value: !GetAtt ApplicationLoadBalancer.DNSName
+
+  DatabaseURL:
+    Value: !GetAtt Database.Endpoint.Address
